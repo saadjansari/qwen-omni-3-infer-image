@@ -1,0 +1,40 @@
+version: 0.2
+
+env:
+  variables:
+    IMAGE_NAME: "qwen3-omni-thinking"
+    IMAGE_TAG: "latest"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Docker Hub..."
+      - SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id dockerhub/creds --query SecretString --output text)
+      - DOCKERHUB_USERNAME=$(echo "$SECRET_JSON" | jq -r .username)
+      - DOCKERHUB_TOKEN=$(echo "$SECRET_JSON" | jq -r .password)
+      - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+      - echo "Docker Hub login OK"
+      - echo "Logging in to ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo "Creating ECR repository if it doesn't exist..."
+      - aws ecr describe-repositories --repository-names $IMAGE_NAME --region $AWS_DEFAULT_REGION || aws ecr create-repository --repository-name $IMAGE_NAME --region $AWS_DEFAULT_REGION
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_NAME
+
+  build:
+    commands:
+      - echo "Building Docker image..."
+      - echo "Build started on $(date)"
+      - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+      - docker tag $IMAGE_NAME:$IMAGE_TAG $REPOSITORY_URI:$IMAGE_TAG
+
+  post_build:
+    commands:
+      - echo "Pushing image to ECR..."
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo "Build completed on $(date)"
+      - echo "Image URI: $REPOSITORY_URI:$IMAGE_TAG"
+      - printf '{"ImageURI":"%s"}' $REPOSITORY_URI:$IMAGE_TAG > build_output.json
+
+artifacts:
+  files:
+    - build_output.json
