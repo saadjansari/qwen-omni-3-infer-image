@@ -166,7 +166,9 @@ def predict_fn(payload, model):
             text_ids = model.generate(
                 **processed_inputs,
                 max_new_tokens=max_new_tokens,
-                use_audio_in_video=USE_AUDIO_IN_VIDEO
+                use_audio_in_video=USE_AUDIO_IN_VIDEO,
+                eos_token_id=processor.tokenizer.eos_token_id,
+                pad_token_id=processor.tokenizer.eos_token_id,
             )
         
         response = processor.batch_decode(
