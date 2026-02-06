@@ -39,7 +39,7 @@ model = None
 processor = None
 process_mm_info = None
 
-MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Thinking"
+MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 FFMPEG_PATH = "/usr/local/bin/ffmpeg"
 
 
