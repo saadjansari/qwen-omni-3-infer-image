@@ -46,7 +46,8 @@ RUN pip install \
     soundfile \
     boto3 \
     flask \
-    gunicorn
+    gunicorn \
+    peft
 
 # Install flash attention (optional - improves performance)
 RUN pip install packaging && \

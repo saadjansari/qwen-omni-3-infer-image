@@ -1,5 +1,6 @@
 """
 SageMaker Inference Script for Qwen3-Omni-30B-A3B-Thinking
+Supports optional LoRA adapter loading via ADAPTER_S3_URI environment variable.
 
 Expected payload:
 {
@@ -43,8 +44,77 @@ MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 FFMPEG_PATH = "/usr/local/bin/ffmpeg"
 
 
+def _download_adapter_from_s3(adapter_s3_uri: str) -> str:
+    """Download LoRA adapter files from S3 to a local directory.
+    
+    Supports both:
+      - S3 prefix (directory): s3://bucket/path/to/adapter/
+      - Single file: s3://bucket/path/to/adapter/adapter_model.safetensors
+    
+    Returns local directory path containing the adapter files.
+    """
+    if not adapter_s3_uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {adapter_s3_uri}")
+
+    local_adapter_dir = "/tmp/lora_adapter"
+    os.makedirs(local_adapter_dir, exist_ok=True)
+
+    s3 = boto3.client("s3")
+    
+    # Parse bucket and prefix
+    path = adapter_s3_uri[5:]
+    bucket = path.split("/", 1)[0]
+    prefix = path.split("/", 1)[1] if "/" in path else ""
+    # Ensure prefix ends with / for directory listing
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+
+    # List and download all objects under the prefix
+    paginator = s3.get_paginator("list_objects_v2")
+    downloaded = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            # Get relative path from prefix
+            rel_path = key[len(prefix):]
+            if not rel_path:  # skip the prefix itself
+                continue
+            local_path = os.path.join(local_adapter_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            s3.download_file(bucket, key, local_path)
+            downloaded += 1
+            logger.info(f"Downloaded adapter file: {rel_path} ({obj['Size']} bytes)")
+
+    if downloaded == 0:
+        raise FileNotFoundError(
+            f"No adapter files found at {adapter_s3_uri}. "
+            "Ensure the S3 path points to a directory containing adapter_model.safetensors and adapter_config.json."
+        )
+
+    # Verify required files exist
+    adapter_files = os.listdir(local_adapter_dir)
+    has_config = "adapter_config.json" in adapter_files
+    has_weights = any(f.startswith("adapter_model") for f in adapter_files)
+    if not has_config:
+        raise FileNotFoundError(
+            f"Missing adapter_config.json. Found files: {adapter_files}"
+        )
+    if not has_weights:
+        raise FileNotFoundError(
+            f"Missing adapter weights (adapter_model.safetensors or adapter_model.bin). "
+            f"Found files: {adapter_files}"
+        )
+
+    logger.info(f"Adapter downloaded: {downloaded} files -> {local_adapter_dir}")
+    return local_adapter_dir
+
+
 def model_fn(model_dir):
-    """Load model - called once when container starts."""
+    """Load model - called once when container starts.
+    
+    If ADAPTER_S3_URI env var is set, downloads the LoRA adapter from S3
+    and merges it into the base model.
+    """
     global model, processor, process_mm_info
     
     logger.info(f"Loading model: {MODEL_PATH}")
@@ -72,9 +142,27 @@ def model_fn(model_dir):
     
     processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL_PATH)
     
+    # --- LoRA adapter loading ---
+    adapter_s3_uri = os.environ.get("ADAPTER_S3_URI", "").strip()
+    if adapter_s3_uri:
+        logger.info(f"Loading LoRA adapter from: {adapter_s3_uri}")
+        from peft import PeftModel
+
+        local_adapter_dir = _download_adapter_from_s3(adapter_s3_uri)
+        model = PeftModel.from_pretrained(model, local_adapter_dir)
+        logger.info("Merging adapter weights into base model...")
+        model = model.merge_and_unload()
+        logger.info("Adapter merged and unloaded successfully")
+
+        # Cleanup adapter files
+        import shutil
+        shutil.rmtree(local_adapter_dir, ignore_errors=True)
+    else:
+        logger.info("No ADAPTER_S3_URI set — running base model")
+
     logger.info("Model loaded successfully!")
     return model
-
+    
 
 def input_fn(request_body, request_content_type):
     """Parse input payload."""
