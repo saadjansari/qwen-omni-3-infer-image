@@ -194,8 +194,8 @@ def model_fn(model_dir):
         model_path = HF_MODEL_ID
 
     logger.info(f"Loading base model from {model_path}")
-
-    from transformers import Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeProcessor
+    
+    from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
     from qwen_omni_utils import process_mm_info as _process_mm_info
 
     process_mm_info = _process_mm_info
@@ -209,12 +209,14 @@ def model_fn(model_dir):
         attn_impl = "eager"
         logger.info("Using eager attention")
 
-    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )
+    model.disable_talker()
+    logger.info("Talker disabled — text-only output mode")
 
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
 
@@ -222,9 +224,22 @@ def model_fn(model_dir):
     adapter_s3_uri = os.environ.get("ADAPTER_S3_URI", "").strip()
     if adapter_s3_uri:
         logger.info(f"Loading LoRA adapter from: {adapter_s3_uri}")
-        from peft import PeftModel
+        from peft import PeftModel, PeftConfig
 
         local_adapter_dir = _download_adapter_from_s3(adapter_s3_uri)
+
+        # ms-swift sets task_type=CAUSAL_LM, but the full Qwen3-Omni model
+        # is a conditional generation model, not a plain causal LM.
+        # Patch the config to avoid PEFT picking the wrong wrapper class.
+        adapter_config_path = os.path.join(local_adapter_dir, "adapter_config.json")
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+        if adapter_config.get("task_type") == "CAUSAL_LM":
+            logger.info("Patching adapter task_type from CAUSAL_LM to None for compatibility")
+            adapter_config["task_type"] = None
+            with open(adapter_config_path, "w") as f:
+                json.dump(adapter_config, f, indent=2)
+
         model = PeftModel.from_pretrained(model, local_adapter_dir)
         logger.info("Merging adapter weights into base model...")
         model = model.merge_and_unload()
