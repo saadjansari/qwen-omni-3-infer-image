@@ -25,7 +25,6 @@ Response:
 import os
 import json
 import tempfile
-import subprocess
 import logging
 
 import torch
@@ -40,8 +39,66 @@ model = None
 processor = None
 process_mm_info = None
 
-MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+HF_MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+MODEL_LOCAL_DIR = "/tmp/model"
 FFMPEG_PATH = "/usr/local/bin/ffmpeg"
+
+
+def _download_model_from_s3(s3_uri: str, local_dir: str, max_workers: int = 16):
+    """Download all files from an S3 prefix to a local directory in parallel."""
+    import concurrent.futures
+
+    if not s3_uri.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URI: {s3_uri}")
+
+    os.makedirs(local_dir, exist_ok=True)
+
+    s3 = boto3.client("s3")
+    path = s3_uri[5:]
+    bucket = path.split("/", 1)[0]
+    prefix = path.split("/", 1)[1] if "/" in path else ""
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+
+    # List all objects
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            rel_path = obj["Key"][len(prefix):]
+            if rel_path:
+                keys.append((obj["Key"], rel_path, obj["Size"]))
+
+    if not keys:
+        raise FileNotFoundError(f"No files found at {s3_uri}")
+
+    total_bytes = sum(size for _, _, size in keys)
+    logger.info(
+        f"Downloading {len(keys)} files ({total_bytes / 1e9:.1f} GB) "
+        f"from {s3_uri} -> {local_dir} with {max_workers} workers"
+    )
+
+    def _download_one(key, rel_path):
+        local_path = os.path.join(local_dir, rel_path)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        s3_client = boto3.client("s3")
+        s3_client.download_file(bucket, key, local_path)
+        return rel_path
+
+    downloaded = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_download_one, key, rel_path): rel_path
+            for key, rel_path, _ in keys
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            fut.result()  # raise if failed
+            downloaded += 1
+            if downloaded % 20 == 0 or downloaded == len(keys):
+                logger.info(f"  Downloaded {downloaded}/{len(keys)} files")
+
+    logger.info(f"Model download complete: {local_dir}")
+    return local_dir
 
 
 def _download_adapter_from_s3(adapter_s3_uri: str) -> str:
@@ -108,22 +165,41 @@ def _download_adapter_from_s3(adapter_s3_uri: str) -> str:
     logger.info(f"Adapter downloaded: {downloaded} files -> {local_adapter_dir}")
     return local_adapter_dir
 
-
 def model_fn(model_dir):
     """Load model - called once when container starts.
-    
-    If ADAPTER_S3_URI env var is set, downloads the LoRA adapter from S3
-    and merges it into the base model.
+
+    Reads MODEL_S3_URI env var to download base model from S3.
+    If ADAPTER_S3_URI env var is set, downloads and merges LoRA adapter.
     """
     global model, processor, process_mm_info
-    
-    logger.info(f"Loading model: {MODEL_PATH}")
-    
+
+    # Determine model path: try S3 first, fall back to HuggingFace
+    model_s3_uri = os.environ.get("MODEL_S3_URI", "").strip()
+    model_path = None
+
+    if model_s3_uri:
+        try:
+            model_path = MODEL_LOCAL_DIR
+            if not os.path.exists(os.path.join(model_path, "config.json")):
+                logger.info(f"Downloading base model from S3: {model_s3_uri}")
+                _download_model_from_s3(model_s3_uri, model_path)
+            else:
+                logger.info(f"Base model already present at {model_path}, skipping download")
+        except Exception as e:
+            logger.warning(f"S3 model download failed: {e}. Falling back to HuggingFace.")
+            model_path = None
+
+    if model_path is None:
+        logger.info(f"Loading base model from HuggingFace: {HF_MODEL_ID}")
+        model_path = HF_MODEL_ID
+
+    logger.info(f"Loading base model from {model_path}")
+
     from transformers import Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeProcessor
     from qwen_omni_utils import process_mm_info as _process_mm_info
-    
+
     process_mm_info = _process_mm_info
-    
+
     # Check for flash attention
     try:
         import flash_attn
@@ -132,16 +208,16 @@ def model_fn(model_dir):
     except ImportError:
         attn_impl = "eager"
         logger.info("Using eager attention")
-    
+
     model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
-        MODEL_PATH,
+        model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )
-    
-    processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL_PATH)
-    
+
+    processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
+
     # --- LoRA adapter loading ---
     adapter_s3_uri = os.environ.get("ADAPTER_S3_URI", "").strip()
     if adapter_s3_uri:
