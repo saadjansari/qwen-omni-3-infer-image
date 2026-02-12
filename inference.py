@@ -223,11 +223,12 @@ def model_fn(model_dir):
     if adapter_s3_uri:
         logger.info(f"Loading LoRA adapter from: {adapter_s3_uri}")
         from peft import PeftModel
+        from safetensors.torch import load_file, save_file
 
         local_adapter_dir = _download_adapter_from_s3(adapter_s3_uri)
 
-        # Patch adapter config for compatibility with ThinkerForConditionalGeneration.
-        # ms-swift trains on the full model where layers are "thinker.model.layers.*",
+        # --- Fix 1: Patch adapter_config.json ---
+        # ms-swift trains on the full Omni model where layers are "thinker.model.layers.*",
         # but ThinkerForConditionalGeneration is already the thinker so layers are
         # "model.layers.*". Also fix task_type to avoid wrong PEFT wrapper class.
         adapter_config_path = os.path.join(local_adapter_dir, "adapter_config.json")
@@ -236,23 +237,48 @@ def model_fn(model_dir):
 
         patched = False
 
-        # Fix 1: task_type CAUSAL_LM -> None
+        # task_type CAUSAL_LM -> None
         if adapter_config.get("task_type") == "CAUSAL_LM":
             adapter_config["task_type"] = None
             patched = True
             logger.info("Patched adapter task_type: CAUSAL_LM -> None")
 
-        # Fix 2: strip "thinker." prefix from target_modules
+        # Strip "thinker." prefix from target_modules
         target = adapter_config.get("target_modules", "")
         if isinstance(target, str) and "thinker.model" in target:
             adapter_config["target_modules"] = target.replace("thinker.model", "model")
             patched = True
-            logger.info(f"Patched adapter target_modules: {adapter_config['target_modules']}")
+            logger.info(f"Patched adapter target_modules: stripped 'thinker.' prefix")
+
+        # Remove bare |gate| (matches MoE router, not Linear)
+        target = adapter_config.get("target_modules", "")
+        if isinstance(target, str) and "|gate|" in target:
+            adapter_config["target_modules"] = target.replace("|gate|", "|")
+            patched = True
+            logger.info("Patched adapter target_modules: removed bare '|gate|'")
 
         if patched:
             with open(adapter_config_path, "w") as f:
                 json.dump(adapter_config, f, indent=2)
+            logger.info(f"Final target_modules: {adapter_config.get('target_modules')}")
 
+        # --- Fix 2: Rename weight keys in safetensors ---
+        # Weight keys have "thinker.model" prefix that must match the model's namespace.
+        weights_path = os.path.join(local_adapter_dir, "adapter_model.safetensors")
+        weights = load_file(weights_path)
+        renamed = {}
+        rename_count = 0
+        for k, v in weights.items():
+            new_k = k.replace("thinker.model", "model")
+            if new_k != k:
+                rename_count += 1
+            renamed[new_k] = v
+        if rename_count > 0:
+            save_file(renamed, weights_path)
+            logger.info(f"Renamed {rename_count}/{len(renamed)} adapter weight keys: 'thinker.model' -> 'model'")
+        del weights, renamed
+
+        # --- Load, merge, discard ---
         model = PeftModel.from_pretrained(model, local_adapter_dir)
         logger.info("Merging adapter weights into base model...")
         model = model.merge_and_unload()
@@ -265,7 +291,7 @@ def model_fn(model_dir):
         logger.info("No ADAPTER_S3_URI set — running base model")
 
     logger.info("Model loaded successfully!")
-    return model 
+    return model
 
 
 def input_fn(request_body, request_content_type):
