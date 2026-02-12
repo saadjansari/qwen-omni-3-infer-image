@@ -36,8 +36,10 @@ RUN pip install --upgrade pip setuptools wheel
 # Install PyTorch (match CUDA version)
 RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
+# Install transformers (pinned to 4.57.6 — Qwen3-Omni support + compatible MoE expert structure for LoRA)
+RUN pip install transformers==4.57.6
 # Install transformers from source (REQUIRED for Qwen3-Omni support)
-RUN pip install git+https://github.com/huggingface/transformers
+#RUN pip install git+https://github.com/huggingface/transformers
 
 # Install other dependencies
 RUN pip install \
