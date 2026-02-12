@@ -195,7 +195,7 @@ def model_fn(model_dir):
 
     logger.info(f"Loading base model from {model_path}")
     
-    from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
+    from transformers import Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeProcessor
     from qwen_omni_utils import process_mm_info as _process_mm_info
 
     process_mm_info = _process_mm_info
@@ -209,14 +209,12 @@ def model_fn(model_dir):
         attn_impl = "eager"
         logger.info("Using eager attention")
 
-    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation=attn_impl,
     )
-    model.disable_talker()
-    logger.info("Talker disabled — text-only output mode")
 
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
 
@@ -224,19 +222,34 @@ def model_fn(model_dir):
     adapter_s3_uri = os.environ.get("ADAPTER_S3_URI", "").strip()
     if adapter_s3_uri:
         logger.info(f"Loading LoRA adapter from: {adapter_s3_uri}")
-        from peft import PeftModel, PeftConfig
+        from peft import PeftModel
 
         local_adapter_dir = _download_adapter_from_s3(adapter_s3_uri)
 
-        # ms-swift sets task_type=CAUSAL_LM, but the full Qwen3-Omni model
-        # is a conditional generation model, not a plain causal LM.
-        # Patch the config to avoid PEFT picking the wrong wrapper class.
+        # Patch adapter config for compatibility with ThinkerForConditionalGeneration.
+        # ms-swift trains on the full model where layers are "thinker.model.layers.*",
+        # but ThinkerForConditionalGeneration is already the thinker so layers are
+        # "model.layers.*". Also fix task_type to avoid wrong PEFT wrapper class.
         adapter_config_path = os.path.join(local_adapter_dir, "adapter_config.json")
         with open(adapter_config_path, "r") as f:
             adapter_config = json.load(f)
+
+        patched = False
+
+        # Fix 1: task_type CAUSAL_LM -> None
         if adapter_config.get("task_type") == "CAUSAL_LM":
-            logger.info("Patching adapter task_type from CAUSAL_LM to None for compatibility")
             adapter_config["task_type"] = None
+            patched = True
+            logger.info("Patched adapter task_type: CAUSAL_LM -> None")
+
+        # Fix 2: strip "thinker." prefix from target_modules
+        target = adapter_config.get("target_modules", "")
+        if isinstance(target, str) and "thinker.model" in target:
+            adapter_config["target_modules"] = target.replace("thinker.model", "model")
+            patched = True
+            logger.info(f"Patched adapter target_modules: {adapter_config['target_modules']}")
+
+        if patched:
             with open(adapter_config_path, "w") as f:
                 json.dump(adapter_config, f, indent=2)
 
@@ -252,8 +265,8 @@ def model_fn(model_dir):
         logger.info("No ADAPTER_S3_URI set — running base model")
 
     logger.info("Model loaded successfully!")
-    return model
-    
+    return model 
+
 
 def input_fn(request_body, request_content_type):
     """Parse input payload."""
