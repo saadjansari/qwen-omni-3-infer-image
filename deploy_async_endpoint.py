@@ -64,6 +64,7 @@ def deploy_async_endpoint(
     autoscale_target_backlog_per_instance: int = 5,
     autoscale_scale_in_cooldown: int = 300,
     autoscale_scale_out_cooldown: int = 60,
+    autoscale_idle_minutes: int = 10,
     wait: bool = True,
 ) -> str:
     """Deploy an async SageMaker endpoint for Qwen3-Omni.
@@ -87,6 +88,7 @@ def deploy_async_endpoint(
         autoscale_target_backlog_per_instance: Target backlog size per instance for scaling.
         autoscale_scale_in_cooldown: Seconds before allowing another scale-in action.
         autoscale_scale_out_cooldown: Seconds before allowing another scale-out action.
+        autoscale_idle_minutes: Minutes of empty backlog before scaling to zero (default 10).
         wait: Whether to block until endpoint is InService.
 
     Returns:
@@ -182,6 +184,7 @@ def deploy_async_endpoint(
             target_backlog_per_instance=autoscale_target_backlog_per_instance,
             scale_in_cooldown=autoscale_scale_in_cooldown,
             scale_out_cooldown=autoscale_scale_out_cooldown,
+            idle_minutes=autoscale_idle_minutes,
         )
 
     print(f"\nEndpoint ready: {endpoint_name}")
@@ -199,6 +202,7 @@ def _setup_autoscaling(
     target_backlog_per_instance: int,
     scale_in_cooldown: int,
     scale_out_cooldown: int,
+    idle_minutes: int = 10,
 ):
     """Configure autoscaling on the async endpoint.
 
@@ -317,14 +321,18 @@ def _setup_autoscaling(
     )
     scale_to_zero_arn = response["PolicyARN"]
 
+    # Compute alarm periods: use 5-min periods, enough evaluation periods to cover idle_minutes
+    scale_to_zero_period = 300  # 5 minutes
+    scale_to_zero_eval_periods = max(1, idle_minutes * 60 // scale_to_zero_period)
+
     cw_client.put_metric_alarm(
         AlarmName=f"{endpoint_name}-scale-to-zero-alarm",
         MetricName="ApproximateBacklogSize",
         Namespace="AWS/SageMaker",
         Dimensions=[{"Name": "EndpointName", "Value": endpoint_name}],
         Statistic="Average",
-        Period=300,
-        EvaluationPeriods=2,
+        Period=scale_to_zero_period,
+        EvaluationPeriods=scale_to_zero_eval_periods,
         Threshold=0.5,
         ComparisonOperator="LessThanThreshold",
         AlarmActions=[scale_to_zero_arn],
@@ -334,7 +342,7 @@ def _setup_autoscaling(
     print("Autoscaling configured:")
     print(f"  scale-from-zero:  HasBacklogWithoutCapacity > 0.5 → set to 1 instance")
     print(f"  scale-on-backlog: target {target_backlog_per_instance} requests/instance (1→N, scale-in disabled)")
-    print(f"  scale-to-zero:    backlog < 0.5 for 10 min → set to 0 instances")
+    print(f"  scale-to-zero:    backlog < 0.5 for {idle_minutes} min → set to 0 instances")
 
 
 # =============================================================================
