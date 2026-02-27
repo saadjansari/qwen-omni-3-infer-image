@@ -2,6 +2,8 @@
 SageMaker Inference Script for Qwen3-Omni-30B-A3B-Thinking
 Supports optional LoRA adapter loading via ADAPTER_S3_URI environment variable.
 
+TODO: LORA ADAPTER currently not tested and may fail.
+
 Expected payload:
 {
     "job_id": "unique-job-identifier",  # optional, auto-generated if not provided
@@ -24,6 +26,7 @@ Response:
 
 import os
 import json
+import subprocess
 import tempfile
 import logging
 
@@ -42,6 +45,118 @@ process_mm_info = None
 HF_MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 MODEL_LOCAL_DIR = "/tmp/model"
 FFMPEG_PATH = "/usr/local/bin/ffmpeg"
+FFPROBE_PATH = "/usr/local/bin/ffprobe"
+SANITIZE_TARGET_FPS = 15
+
+
+def _ffprobe(path: str) -> dict:
+    """Run ffprobe and return parsed JSON."""
+    cmd = [
+        FFPROBE_PATH, "-v", "quiet",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def _get_fps(video_stream: dict) -> float:
+    """Parse fps from r_frame_rate string like '30/1' or '30000/1001'."""
+    raw = video_stream.get("r_frame_rate", "0/1")
+    try:
+        num, den = raw.split("/")
+        return int(num) / int(den)
+    except Exception:
+        return 0.0
+
+
+def sanitize_video(input_path: str) -> str:
+    """Probe and conditionally sanitize a video for Qwen3-Omni inference.
+
+    Fixes: non-mp4 container, non-h264 video codec, missing/non-aac audio, fps>15.
+    Returns original path if no changes needed, otherwise a new temp .mp4 path.
+    Caller is responsible for cleaning up the new file if one is created.
+    """
+    info = _ffprobe(input_path)
+    streams = info.get("streams", [])
+
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+
+    if not video_streams:
+        raise ValueError(f"No video stream found in {input_path}")
+
+    vs = video_streams[0]
+    aus = audio_streams[0] if audio_streams else {}
+
+    video_codec = vs.get("codec_name", "")
+    audio_codec = aus.get("codec_name", "")
+    fps = _get_fps(vs)
+    container = os.path.splitext(input_path)[1].lower()
+
+    needs_container_fix = container not in (".mp4",)
+    needs_video_transcode = video_codec not in ("h264",)
+    needs_audio_add = len(audio_streams) == 0
+    needs_audio_transcode = not needs_audio_add and audio_codec not in ("aac",)
+    needs_fps_fix = fps > SANITIZE_TARGET_FPS
+
+    reasons = []
+    if needs_container_fix:
+        reasons.append(f"container={container}")
+    if needs_video_transcode:
+        reasons.append(f"video_codec={video_codec}")
+    if needs_audio_add:
+        reasons.append("no_audio")
+    if needs_audio_transcode:
+        reasons.append(f"audio_codec={audio_codec}")
+    if needs_fps_fix:
+        reasons.append(f"fps={fps:.1f}")
+
+    if not reasons:
+        logger.info(f"Sanitize: no changes needed for {input_path}")
+        return input_path
+
+    logger.info(f"Sanitize: fixing [{', '.join(reasons)}] for {input_path}")
+
+    out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out.close()
+
+    cmd = [FFMPEG_PATH, "-y", "-i", input_path]
+
+    if needs_audio_add:
+        duration = float(info.get("format", {}).get("duration", 0) or vs.get("duration", 0))
+        cmd += ["-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono", "-t", str(duration)]
+
+    if needs_video_transcode or needs_fps_fix:
+        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+    else:
+        cmd += ["-c:v", "copy"]
+
+    if needs_fps_fix:
+        cmd += ["-r", str(SANITIZE_TARGET_FPS)]
+
+    if needs_audio_add:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "32k"]
+    elif needs_audio_transcode:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-c:a", "copy"]
+
+    cmd += ["-movflags", "+faststart", out.name]
+
+    logger.info(f"Sanitize cmd: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    if result.returncode != 0:
+        if os.path.exists(out.name):
+            os.unlink(out.name)
+        raise RuntimeError(f"ffmpeg sanitize failed: {result.stderr[-500:]}")
+
+    logger.info(f"Sanitize: done -> {out.name} ({os.path.getsize(out.name)} bytes)")
+    return out.name
 
 
 def _download_model_from_s3(s3_uri: str, local_dir: str, max_workers: int = 16):
@@ -306,6 +421,7 @@ def predict_fn(payload, model):
     global processor, process_mm_info
     
     local_video = None
+    sanitized_video = None
     
     # Auto-generate job_id if not provided
     import uuid
@@ -327,6 +443,11 @@ def predict_fn(payload, model):
         local_video = download_s3_video(s3_uri)
         logger.info(f"[{job_id}] Downloaded video: {os.path.getsize(local_video)} bytes")
         
+        # Sanitize video (no-op if already clean)
+        sanitized_video = sanitize_video(local_video)
+        video_path = sanitized_video  # use sanitized version for inference
+        logger.info(f"[{job_id}] Using video: {video_path} ({os.path.getsize(video_path)} bytes)")
+        
         # Build conversation with video settings
         conversation = []
         if system_prompt:
@@ -340,7 +461,7 @@ def predict_fn(payload, model):
             "content": [
                 {
                     "type": "video",
-                    "video": local_video,
+                    "video": video_path,
                     "fps": fps,
                     "max_frames": max_frames,
                     "max_pixels": max_pixels
@@ -405,7 +526,9 @@ def predict_fn(payload, model):
         return {"job_id": job_id, "error": str(e), "status": "error"}
     
     finally:
-        # Cleanup temp file
+        # Cleanup temp files
+        if sanitized_video and sanitized_video != local_video and os.path.exists(sanitized_video):
+            os.unlink(sanitized_video)
         if local_video and os.path.exists(local_video):
             os.unlink(local_video)
 
